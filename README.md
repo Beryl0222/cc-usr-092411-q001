@@ -11,8 +11,9 @@
   - `Agreement`：展期、展厅、照度、运输、保险、数字传播用途；改期通过版本链（`supersedes`）保留旧条款；
   - `Handover` / `ConditionReport` / `Incident`：出库、到馆、布展、撤展、归还五类交接，双方签认；
   - `LabelVersion`：展签版本，发布即锁定证据快照。
-- `service.py` — HTTP 编解码与状态码映射，规则全部委托给 `domain.py`。
-- `domain_contract.py` — 业务规则的可执行契约（24 个用例）。
+- `service.py` — HTTP 编解码与状态码映射，规则全部委托给 `domain.py`；可选 `--state` 状态文件，写命令原子落盘、重启恢复。
+- `domain_contract.py` — 业务规则的可执行契约。
+- `incident_contract.py` / `api_incident_contract.py` — 事故解除与冻结关系的领域/接口回归契约（复损重放、旧请求迟到、逆序解除、重复扫码、并发单次受理、重启继续交接、旧数据补编）。
 
 ## 关键规则
 
@@ -20,7 +21,7 @@
 2. **协议约束**：展期起止、展厅、照度上限（勒克斯）、运输方式、保险（如钉到钉）、数字传播用途随协议保存；跨馆改期生成新版本并保留旧版，当前授权永远取最新版。
 3. **交接签认**：五类交接按固定生命周期顺序办理，交出方与接收方角色固定（如出库 = 出借馆 → 运输方），缺签认人或角色不符一律拒绝。
 4. **重复扫码幂等**：扫码标识全局唯一；重复扫码返回 `409` 且不产生第二条记录，被拒绝的扫码不会被消费。
-5. **损伤冻结**：状态报告记为“损伤”时立即冻结该作品的全部后续交接，登记损伤事件并保全损伤前/后图像哈希（sha256）；须凭书面复核结论解除后，交接链才能继续。
+5. **损伤冻结**：状态报告记为“损伤”时立即冻结该作品的全部后续交接，登记损伤事件并保全损伤前/后图像哈希（sha256）。冻结状态完全由事故派生——**只要还存在任一未解除事故，作品就保持冻结**；须凭书面复核解除（处理人、结论、证据摘要、解除编号齐全），且全部事故关闭后交接链才能继续。解除请求按 `resolution_id` 幂等：完全重放返回原结果（`replayed: true`）且不改变当前状态；同一编号内容变化返回 `409`；编号不得跨事故复用；并发提交只有一次首次受理。旧数据中缺少解除标识的已解除事故，恢复时按 `RES-{事故编号}-LEGACY` 确定性补编。
 6. **展签快照**：发布日期确认后锁定证据快照（作品、区段、十六位作者贡献、当时协议版本、交接记录、保管状态、未解除风险）；之后的学术更正或改期只产生新版展签，旧版展签与其快照永不改变。
 7. **争议追溯**：`/works/{id}/segments/{sid}` 从争议区段直达实体、该区段上的作者贡献、当前保管责任与相关损伤事件；`/works/{id}/risk` 汇总保管、授权范围与未解除风险。
 
@@ -31,12 +32,12 @@
 | GET | `/health` | 服务身份健康检查 |
 | POST | `/works` | 登记作品（可含区段与贡献） |
 | GET | `/works/{id}` | 作品视图（结构、当前协议、保管状态、冻结标记） |
-| GET | `/works/{id}/risk` | 当前保管责任、授权范围、未解除风险 |
+| GET | `/works/{id}/risk` | 当前保管责任、授权范围、全部历史事故、未解除风险与冻结原因 |
 | GET | `/works/{id}/segments/{sid}` | 局部状态争议定位 |
 | POST | `/agreements` | 订立借展协议 |
 | POST | `/agreements/{id}/reschedule` | 跨馆改期/改条款，生成新版本 |
 | POST | `/handovers` | 办理一次双方签认交接 |
-| POST | `/incidents/{id}/resolve` | 损伤复核解除、恢复交接 |
+| POST | `/incidents/{id}/resolve` | 损伤复核解除（需 `resolution_id`/`handler`/`conclusion`/`evidence_summary`，幂等重放），全部事故关闭后恢复交接 |
 | POST | `/works/{id}/labels` | 起草展签 |
 | POST | `/works/{id}/labels/publish` | 确认发布日期并锁定快照 |
 | POST | `/works/{id}/labels/correct` | 学术更正，另起新版 |
@@ -48,9 +49,12 @@
 
 ```bash
 python3 service.py --check      # 自检
-npm test                        # service_contract + domain_contract
+npm test                        # service_contract + api_contract + domain_contract
 python3 service.py --port 8000  # 启动 HTTP 服务
+python3 service.py --state ./loan-state.json   # 启动并启用状态文件（写命令原子落盘，重启自动恢复）
 ```
+
+`--state` 也可用环境变量 `LOAN_STATE_FILE` 指定。状态文件为全量 JSON 快照（format=2）：每次写命令在同一临界区内执行并落盘，进程重启后从快照恢复；冻结状态不单独存储，恢复时按未解除事故重新派生。读取 format=1 旧快照时，缺少解除标识的已解除事故按 `RES-{事故编号}-LEGACY` 确定性补编（处理人标注为“（旧数据迁移）”）。
 
 ## 测试与构建
 
