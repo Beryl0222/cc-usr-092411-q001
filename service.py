@@ -6,6 +6,7 @@
 
 import argparse
 import json
+import os
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -20,6 +21,10 @@ from domain import (
 SERVICE_ID = "museum-loan"
 SERVICE_NAME = "馆际作品借展"
 
+# 通过环境变量或 --state-file 指定后，交接/事故/解除记录原子落盘，
+# 服务重启即可从快照继续交接（冻结状态由未解除事故重新派生）。
+STATE_FILE_ENV = "LOAN_STATE_FILE"
+
 
 def health_payload():
     """返回稳定的服务身份信息。"""
@@ -29,12 +34,12 @@ def health_payload():
 class ApiState:
     """进程内共享的领域记录（单实例部署足够；多实例需换持久层）。"""
 
-    def __init__(self):
-        self.registry = LoanRegistry()
+    def __init__(self, state_file: str | None = None):
+        self.registry = LoanRegistry(state_file=state_file)
         self.routes = build_routes()
 
 
-STATE = ApiState()
+STATE = ApiState(state_file=os.environ.get(STATE_FILE_ENV) or None)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -95,10 +100,19 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    global STATE
     parser = argparse.ArgumentParser(description=SERVICE_NAME)
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument(
+        "--state-file",
+        default=None,
+        help="状态快照文件路径；也可用环境变量 LOAN_STATE_FILE 指定",
+    )
     args = parser.parse_args()
+    state_file = args.state_file or os.environ.get(STATE_FILE_ENV) or None
+    if state_file:
+        STATE = ApiState(state_file=state_file)
     if args.check:
         assert health_payload()["service"] == SERVICE_ID
         LoanRegistry().register_work(

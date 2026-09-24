@@ -10,6 +10,10 @@
 - 跨馆改期与局部状态争议下，从展签/区段定位实体、保管、授权与风险。
 """
 
+import json
+import os
+import tempfile
+import threading
 import unittest
 
 from domain import (
@@ -298,10 +302,18 @@ class DamageAndFreezeTest(unittest.TestCase):
                     "before_hashes": ["c" * 64], "after_hashes": ["d" * 64]},
         ))
         incident = self.registry.risk_view(self.work_id)["open_risks"][0]
+        # 解除必须留下处理人、结论、证据摘要与解除编号。
         with self.assertRaises(DomainError):
-            self.registry.resolve_incident(incident["incident_id"], "  ")
-        result = self.registry.resolve_incident(incident["incident_id"], "修复师与双方馆员复核，确认可继续展出")
+            self.registry.resolve_incident(incident["incident_id"], {"resolution_note": "  "})
+        result = self.registry.resolve_incident(incident["incident_id"], {
+            "resolution_id": "RES-1",
+            "resolver": "复核员钱某",
+            "resolution_note": "修复师与双方馆员复核，确认可继续展出",
+            "evidence_summary": "修复后比对照与到馆损伤照一致，c/d 哈希保全",
+        })
         self.assertTrue(result["resolved"])
+        self.assertFalse(result["replayed"])
+        self.assertFalse(result["work_frozen"])
         self.assertFalse(self.registry.get_work_view(self.work_id)["frozen"])
         self.registry.record_handover(
             handover_payload(self.work_id, "布展", "SCAN-3", "2026-09-30"))
@@ -416,6 +428,373 @@ class SegmentDisputeTest(unittest.TestCase):
         risk2 = self.registry.risk_view(self.work_id)
         self.assertEqual(risk2["authorization"]["max_lux"], 30)
         self.assertEqual(risk2["authorization"]["version"], 2)
+
+
+class IncidentResolutionRegressionTest(unittest.TestCase):
+    """事故解除与作品冻结关系的回归用例。"""
+
+    def setUp(self):
+        self.registry = LoanRegistry()
+        work = self.registry.register_work("百年会面图卷（复损件）", "长卷", "甲馆")
+        self.work_id = work["work"]["work_id"]
+        self.registry.create_agreement(agreement_payload(self.work_id))
+
+    def _resolution(self, resolution_id, note="复核通过，可继续流转", **overrides):
+        payload = {
+            "resolution_id": resolution_id,
+            "resolver": "复核员钱某",
+            "resolution_note": note,
+            "evidence_summary": "前后图像哈希与检视记录一致",
+        }
+        payload.update(overrides)
+        return payload
+
+    def _damage(self, htype, scan, day, note, before="a" * 64, after="b" * 64):
+        return self.registry.record_handover(handover_payload(
+            self.work_id, htype, scan, day,
+            report={"condition": "损伤", "damage_note": note,
+                    "before_hashes": [before], "after_hashes": [after]},
+        ))
+
+    # -- 复损 --------------------------------------------------------------
+
+    def test_replay_of_first_resolution_after_redamage_does_not_unfreeze(self):
+        self.registry.record_handover(
+            handover_payload(self.work_id, "出库", "SCAN-1", "2026-09-25"))
+        first = self._damage("到馆", "SCAN-2", "2026-09-27", "第一次运输：画心折痕")
+        first_incident = first["incident_id"]
+        first_request = self._resolution("RES-1", "修复后双方确认，可继续布展")
+        result = self.registry.resolve_incident(first_incident, first_request)
+        self.assertFalse(result["replayed"])
+        self.assertFalse(result["work_frozen"])
+
+        # 交接继续推进，直到第二次运输（撤展交还运输方）再次损伤。
+        self.registry.record_handover(
+            handover_payload(self.work_id, "布展", "SCAN-3", "2026-09-30"))
+        second = self._damage("撤展", "SCAN-4", "2027-01-05", "第二次运输：尾纸新增撕裂")
+        second_incident = second["incident_id"]
+        self.assertNotEqual(first_incident, second_incident)
+        self.assertTrue(self.registry.get_work_view(self.work_id)["frozen"])
+
+        # 借展专员重复提交第一次事故的解除请求（完全重放）。
+        replay = self.registry.resolve_incident(first_incident, dict(first_request))
+        self.assertTrue(replay["replayed"])  # 返回原结果
+        # 但当前状态不得改变：新事故仍开放，作品保持冻结。
+        self.assertTrue(replay["work_frozen"])
+        self.assertEqual(replay["open_incident_ids"], [second_incident])
+        risk = self.registry.risk_view(self.work_id)
+        self.assertTrue(risk["frozen"])
+        self.assertEqual([r["incident_id"] for r in risk["open_risks"]], [second_incident])
+        self.assertEqual(len(risk["incidents"]), 2)  # 历史事故全部可查
+        self.assertTrue(any("尾纸" in reason for reason in risk["frozen_reason"]))
+        # 后续归还不能绕过复核。
+        with self.assertRaises(ConflictError):
+            self.registry.record_handover(
+                handover_payload(self.work_id, "归还", "SCAN-5", "2027-01-07"))
+
+    def test_replay_with_changed_content_is_conflict(self):
+        self.registry.record_handover(
+            handover_payload(self.work_id, "出库", "SCAN-1", "2026-09-25"))
+        incident_id = self._damage("到馆", "SCAN-2", "2026-09-27", "折痕")["incident_id"]
+        self.registry.resolve_incident(incident_id, self._resolution("RES-1", "结论甲"))
+        # 同一解除编号、内容变化 → 冲突。
+        with self.assertRaises(ConflictError):
+            self.registry.resolve_incident(
+                incident_id, self._resolution("RES-1", "结论被篡改"))
+        with self.assertRaises(ConflictError):
+            self.registry.resolve_incident(
+                incident_id, self._resolution("RES-1", "结论甲", resolver="另一个人"))
+        # 完全一致的重放仍然成功且不改变状态。
+        replay = self.registry.resolve_incident(
+            incident_id, self._resolution("RES-1", "结论甲"))
+        self.assertTrue(replay["replayed"])
+
+    # -- 旧请求迟到 --------------------------------------------------------
+
+    def test_late_request_with_other_resolution_id_is_conflict(self):
+        self.registry.record_handover(
+            handover_payload(self.work_id, "出库", "SCAN-1", "2026-09-25"))
+        incident_id = self._damage("到馆", "SCAN-2", "2026-09-27", "折痕")["incident_id"]
+        self.registry.resolve_incident(incident_id, self._resolution("RES-1"))
+        # 另一张解除单（迟到的旧请求/不同编号）不能再处理同一起事故。
+        with self.assertRaises(ConflictError):
+            self.registry.resolve_incident(incident_id, self._resolution("RES-2"))
+
+    def test_resolution_id_cannot_be_reused_across_incidents(self):
+        self.registry.record_handover(
+            handover_payload(self.work_id, "出库", "SCAN-1", "2026-09-25"))
+        view = self.registry.record_handover(handover_payload(
+            self.work_id, "到馆", "SCAN-2", "2026-09-27",
+            report={
+                "condition": "损伤",
+                "damage_items": [
+                    {"note": "画心折痕", "before_hashes": ["a" * 64], "after_hashes": ["b" * 64]},
+                    {"note": "引首磨损", "before_hashes": ["c" * 64], "after_hashes": ["d" * 64]},
+                ],
+            },
+        ))
+        first_id, second_id = view["incident_ids"]
+        self.registry.resolve_incident(first_id, self._resolution("RES-1"))
+        with self.assertRaises(ConflictError):
+            self.registry.resolve_incident(second_id, self._resolution("RES-1"))
+
+    # -- 两起事故逆序解除 --------------------------------------------------
+
+    def test_two_incidents_must_both_close_before_handover_resumes(self):
+        self.registry.record_handover(
+            handover_payload(self.work_id, "出库", "SCAN-1", "2026-09-25"))
+        view = self.registry.record_handover(handover_payload(
+            self.work_id, "到馆", "SCAN-2", "2026-09-27",
+            report={
+                "condition": "损伤",
+                "damage_items": [
+                    {"note": "画心折痕", "before_hashes": ["a" * 64], "after_hashes": ["b" * 64]},
+                    {"note": "尾纸水渍", "before_hashes": ["c" * 64], "after_hashes": ["d" * 64]},
+                ],
+            },
+        ))
+        first_id, second_id = view["incident_ids"]
+        risk = self.registry.risk_view(self.work_id)
+        self.assertEqual(len(risk["open_risks"]), 2)
+
+        # 逆序解除：先解除第二起，第一起仍挂账，作品不能恢复交接。
+        resolved_second = self.registry.resolve_incident(second_id, self._resolution("RES-2"))
+        self.assertTrue(resolved_second["work_frozen"])
+        self.assertEqual(resolved_second["open_incident_ids"], [first_id])
+        with self.assertRaises(ConflictError):
+            self.registry.record_handover(
+                handover_payload(self.work_id, "布展", "SCAN-3", "2026-09-30"))
+
+        resolved_first = self.registry.resolve_incident(first_id, self._resolution("RES-1"))
+        self.assertFalse(resolved_first["work_frozen"])
+        self.assertEqual(resolved_first["frozen_reason"], [])
+        # 全部事故关闭后交接链才恢复。
+        resumed = self.registry.record_handover(
+            handover_payload(self.work_id, "布展", "SCAN-3", "2026-09-30"))
+        self.assertEqual(resumed["resulting_status"], "展出中")
+
+    # -- 重复扫码 ----------------------------------------------------------
+
+    def test_duplicate_scan_after_resolution_still_rejected_and_not_consumed(self):
+        self.registry.record_handover(
+            handover_payload(self.work_id, "出库", "SCAN-1", "2026-09-25"))
+        incident_id = self._damage("到馆", "SCAN-2", "2026-09-27", "折痕")["incident_id"]
+        self.registry.resolve_incident(incident_id, self._resolution("RES-1"))
+        # 旧扫码在解除后依旧不能复用。
+        with self.assertRaises(ConflictError):
+            self.registry.record_handover(
+                handover_payload(self.work_id, "布展", "SCAN-2", "2026-09-30"))
+        resumed = self.registry.record_handover(
+            handover_payload(self.work_id, "布展", "SCAN-3", "2026-09-30"))
+        self.assertEqual(resumed["type"], "布展")
+
+    # -- 并发只成功一次 ----------------------------------------------------
+
+    def test_concurrent_resolution_succeeds_only_once(self):
+        self.registry.record_handover(
+            handover_payload(self.work_id, "出库", "SCAN-1", "2026-09-25"))
+        incident_id = self._damage("到馆", "SCAN-2", "2026-09-27", "折痕")["incident_id"]
+
+        # 相同请求并发：恰好一次真正生效，其余为幂等重放，无重复解除记录。
+        barrier = threading.Barrier(6)
+        outcomes = []
+
+        def worker_identical():
+            barrier.wait()
+            outcomes.append(self.registry.resolve_incident(
+                incident_id, self._resolution("RES-SAME")))
+
+        threads = [threading.Thread(target=worker_identical) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sum(1 for o in outcomes if not o["replayed"]), 1)
+        self.assertEqual(sum(1 for o in outcomes if o["replayed"]), 5)
+        incident = next(i for i in self.registry.incidents if i.incident_id == incident_id)
+        self.assertTrue(incident.resolved)
+        self.assertEqual(incident.resolution_id, "RES-SAME")
+
+        # 不同编号并发争抢同一起（已解除）事故：全部冲突，无一改写记录。
+        barrier2 = threading.Barrier(5)
+        errors = []
+
+        def worker_distinct(index):
+            barrier2.wait()
+            try:
+                self.registry.resolve_incident(incident_id, self._resolution(f"RES-X{index}"))
+            except ConflictError:
+                errors.append(index)
+
+        threads = [threading.Thread(target=worker_distinct, args=(i,)) for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(errors), 5)
+        self.assertEqual(incident.resolution_id, "RES-SAME")
+
+    # -- 重启后继续交接 ----------------------------------------------------
+
+    def test_chain_resumes_across_restart_and_open_incident_keeps_frozen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = os.path.join(tmp, "loan-state.json")
+            registry = LoanRegistry(state_file=state_file)
+            work = registry.register_work("重启续办长卷", "长卷", "甲馆")
+            work_id = work["work"]["work_id"]
+            registry.create_agreement(agreement_payload(work_id))
+            registry.record_handover(
+                handover_payload(work_id, "出库", "SCAN-1", "2026-09-25"))
+            damaged = registry.record_handover(handover_payload(
+                work_id, "到馆", "SCAN-2", "2026-09-27",
+                report={"condition": "损伤", "damage_note": "折痕",
+                        "before_hashes": ["a" * 64], "after_hashes": ["b" * 64]},
+            ))
+            request = {
+                "resolution_id": "RES-RESTART",
+                "resolver": "复核员钱某",
+                "resolution_note": "复核通过",
+                "evidence_summary": "哈希保全",
+            }
+            registry.resolve_incident(damaged["incident_id"], request)
+            registry.record_handover(
+                handover_payload(work_id, "布展", "SCAN-3", "2026-09-30"))
+            self.assertTrue(os.path.exists(state_file))
+
+            # 服务重启：从快照重建。
+            restarted = LoanRegistry(state_file=state_file)
+            self.assertEqual(restarted.get_work_view(work_id)["custody"]["status"], "展出中")
+            self.assertFalse(restarted.get_work_view(work_id)["frozen"])
+            # 扫码记录持久保留，重复扫码仍被拒。
+            with self.assertRaises(ConflictError):
+                restarted.record_handover(
+                    handover_payload(work_id, "撤展", "SCAN-1", "2027-01-05"))
+            # 解除幂等键也跨重启有效，重放返回原结果。
+            replay = restarted.resolve_incident(damaged["incident_id"], dict(request))
+            self.assertTrue(replay["replayed"])
+            # 交接链从中断处继续直至归还。
+            restarted.record_handover(
+                handover_payload(work_id, "撤展", "SCAN-4", "2027-01-05"))
+            restarted.record_handover(
+                handover_payload(work_id, "归还", "SCAN-5", "2027-01-07"))
+            self.assertEqual(
+                restarted.get_work_view(work_id)["custody"]["status"], "已归还")
+
+    def test_restart_with_open_incident_rederives_freeze(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = os.path.join(tmp, "loan-state.json")
+            registry = LoanRegistry(state_file=state_file)
+            work = registry.register_work("重启仍冻结件", "独立作品", "甲馆")
+            work_id = work["work"]["work_id"]
+            registry.create_agreement(agreement_payload(work_id))
+            registry.record_handover(
+                handover_payload(work_id, "出库", "SCAN-1", "2026-09-25"))
+            registry.record_handover(handover_payload(
+                work_id, "到馆", "SCAN-2", "2026-09-27",
+                report={"condition": "损伤", "damage_note": "尚未复核的折痕",
+                        "before_hashes": ["a" * 64], "after_hashes": ["b" * 64]},
+            ))
+            restarted = LoanRegistry(state_file=state_file)
+            risk = restarted.risk_view(work_id)
+            self.assertTrue(risk["frozen"])
+            self.assertEqual(len(risk["open_risks"]), 1)
+            with self.assertRaises(ConflictError):
+                restarted.record_handover(
+                    handover_payload(work_id, "布展", "SCAN-3", "2026-09-30"))
+
+    # -- 旧数据兼容 --------------------------------------------------------
+
+    def test_legacy_resolved_incident_without_resolution_id_is_supported(self):
+        registry = LoanRegistry()
+        work = registry.register_work("旧数据件", "独立作品", "甲馆")
+        work_id = work["work"]["work_id"]
+        registry.create_agreement(agreement_payload(work_id))
+        registry.record_handover(
+            handover_payload(work_id, "出库", "SCAN-1", "2026-09-25"))
+        registry.record_handover(handover_payload(
+            work_id, "到馆", "SCAN-2", "2026-09-27",
+            report={"condition": "损伤", "damage_note": "旧系统登记的折痕",
+                    "before_hashes": ["a" * 64], "after_hashes": ["b" * 64]},
+        ))
+        incident = registry.incidents[-1]
+        # 模拟旧版本写入：只有结论、没有解除编号/处理人/证据摘要。
+        incident.resolved = True
+        incident.resolution_note = "旧系统里已复核通过"
+        snapshot = registry.snapshot_state()
+        for raw_incident in snapshot["incidents"]:
+            raw_incident.pop("resolution_id", None)
+            raw_incident.pop("resolver", None)
+            raw_incident.pop("evidence_summary", None)
+            raw_incident.pop("resolved_on", None)
+
+        restored = LoanRegistry()
+        restored.load_state(snapshot)
+        view = restored.risk_view(work_id)
+        self.assertFalse(view["frozen"])  # 冻结由事故状态重新派生
+        self.assertEqual(view["open_risks"], [])
+        stored = view["incidents"][0]
+        # 确定性补齐：legacy-resolution:<incident_id>。
+        self.assertEqual(stored["resolution_id"],
+                         f"legacy-resolution:{stored['incident_id']}")
+
+        # 不带编号、内容一致的旧请求重放：返回原结果且不改状态。
+        replay = restored.resolve_incident(stored["incident_id"], {
+            "resolver": "",
+            "resolution_note": "旧系统里已复核通过",
+            "evidence_summary": "",
+        })
+        self.assertTrue(replay["replayed"])
+        # 内容被改动则冲突。
+        with self.assertRaises(ConflictError):
+            restored.resolve_incident(stored["incident_id"], {
+                "resolution_note": "旧系统里已复核通过",
+                "resolver": "", "evidence_summary": "新加的证据",
+            })
+        # 迟到的、带新编号的请求同样冲突。
+        with self.assertRaises(ConflictError):
+            restored.resolve_incident(
+                stored["incident_id"], self._resolution("RES-NEW"))
+
+    # -- 展签证据快照一致性 ------------------------------------------------
+
+    def test_label_snapshot_records_full_incident_history_and_freeze_reason(self):
+        self.registry.create_label(self.work_id, "复损长卷展签", [])
+        self.registry.record_handover(
+            handover_payload(self.work_id, "出库", "SCAN-1", "2026-09-25"))
+        first = self._damage("到馆", "SCAN-2", "2026-09-27", "第一次折痕")
+        first_snapshot = self.registry.publish_label(self.work_id, "2026-09-28")
+        self.assertTrue(first_snapshot["evidence_snapshot"]["frozen"])
+        self.assertEqual(len(first_snapshot["evidence_snapshot"]["incidents"]), 1)
+
+        # 解除第一起并发生第二次损伤（复损）。
+        self.registry.resolve_incident(first["incident_id"], self._resolution("RES-1"))
+        self.registry.record_handover(
+            handover_payload(self.work_id, "布展", "SCAN-3", "2026-09-30"))
+        second = self._damage("撤展", "SCAN-4", "2027-01-05", "第二次撕裂")
+
+        # 旧版快照永不改变。
+        old = self.registry.label_version(self.work_id, 1)["evidence_snapshot"]
+        self.assertEqual(len(old["incidents"]), 1)
+        self.assertTrue(old["frozen"])
+
+        corrected = self.registry.correct_label(self.work_id, "复损后修订展签", [])
+        self.registry.publish_label(self.work_id, "2027-01-06")
+        snap = self.registry.label_version(self.work_id, 2)["evidence_snapshot"]
+        self.assertEqual(len(snap["incidents"]), 2)
+        by_id = {i["incident_id"]: i for i in snap["incidents"]}
+        self.assertTrue(by_id[first["incident_id"]]["resolved"])
+        self.assertEqual(by_id[first["incident_id"]]["resolution_id"], "RES-1")
+        self.assertFalse(by_id[second["incident_id"]]["resolved"])
+        self.assertTrue(snap["frozen"])
+        self.assertEqual([r["incident_id"] for r in snap["open_risks"]],
+                         [second["incident_id"]])
+        self.assertTrue(any(second["incident_id"] in r for r in snap["frozen_reason"]))
+        # 风险视图与展签快照对事故历史的展示一致。
+        risk = self.registry.risk_view(self.work_id)
+        self.assertEqual(
+            [i["incident_id"] for i in risk["incidents"]],
+            [i["incident_id"] for i in snap["incidents"]],
+        )
 
 
 if __name__ == "__main__":
